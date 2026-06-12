@@ -15,6 +15,7 @@ import (
 	_ "github.com/mattn/go-sqlite3"
 	"github.com/mdp/qrterminal"
 	"go.mau.fi/whatsmeow"
+	waProto "go.mau.fi/whatsmeow/binary/proto"
 	"go.mau.fi/whatsmeow/store/sqlstore"
 	"go.mau.fi/whatsmeow/types/events"
 	waLog "go.mau.fi/whatsmeow/util/log"
@@ -95,6 +96,60 @@ func (s *MessageStore) GetRecentMessages(limit int) ([]map[string]interface{}, e
 	return msgs, nil
 }
 
+func storeHistoryMessage(store *MessageStore, conversations []*waProto.Conversation) {
+	for _, conv := range conversations {
+		chatJID := conv.GetId()
+		for _, histMsg := range conv.GetMessages() {
+			info := histMsg.GetMessage()
+			if info == nil {
+				continue
+			}
+			msg := info.GetMessage()
+			if msg == nil {
+				continue
+			}
+
+			content := msg.GetConversation()
+			if content == "" {
+				if ext := msg.GetExtendedTextMessage(); ext != nil {
+					content = ext.GetText()
+				}
+			}
+
+			mediaType := ""
+			if msg.GetImageMessage() != nil {
+				mediaType = "image"
+			} else if msg.GetAudioMessage() != nil {
+				mediaType = "audio"
+			}
+
+			fromMe := info.GetKey().GetFromMe()
+			sender := info.GetKey().GetParticipant()
+			if sender == "" {
+				if fromMe {
+					sender = "me"
+				} else {
+					sender = chatJID
+				}
+			}
+
+			ts := time.Unix(int64(info.GetMessageTimestamp()), 0)
+
+			if err := store.StoreMessage(
+				info.GetKey().GetId(),
+				chatJID,
+				sender,
+				content,
+				ts,
+				fromMe,
+				mediaType,
+			); err != nil {
+				fmt.Fprintf(os.Stderr, "store history error: %v\n", err)
+			}
+		}
+	}
+}
+
 func main() {
 	logger := waLog.Stdout("Client", "INFO", true)
 
@@ -120,38 +175,36 @@ func main() {
 	defer messageStore.db.Close()
 
 	client.AddEventHandler(func(evt interface{}) {
-		v, ok := evt.(*events.Message)
-		if !ok {
-			return
-		}
-
-		content := v.Message.GetConversation()
-		if content == "" {
-			if ext := v.Message.GetExtendedTextMessage(); ext != nil {
-				content = ext.GetText()
+		switch v := evt.(type) {
+		case *events.Message:
+			content := v.Message.GetConversation()
+			if content == "" {
+				if ext := v.Message.GetExtendedTextMessage(); ext != nil {
+					content = ext.GetText()
+				}
 			}
-		}
+			mediaType := ""
+			if v.Message.GetImageMessage() != nil {
+				mediaType = "image"
+			} else if v.Message.GetAudioMessage() != nil {
+				mediaType = "audio"
+			}
+			if err := messageStore.StoreMessage(
+				v.Info.ID,
+				v.Info.Chat.String(),
+				v.Info.Sender.User,
+				content,
+				v.Info.Timestamp,
+				v.Info.IsFromMe,
+				mediaType,
+			); err != nil {
+				fmt.Fprintf(os.Stderr, "store message error: %v\n", err)
+			}
+			fmt.Printf("New message from %s: %s\n", v.Info.Sender.User, content)
 
-		mediaType := ""
-		if v.Message.GetImageMessage() != nil {
-			mediaType = "image"
-		} else if v.Message.GetAudioMessage() != nil {
-			mediaType = "audio"
+		case *events.HistorySync:
+			storeHistoryMessage(messageStore, v.Data.GetConversations())
 		}
-
-		if err := messageStore.StoreMessage(
-			v.Info.ID,
-			v.Info.Chat.String(),
-			v.Info.Sender.User,
-			content,
-			v.Info.Timestamp,
-			v.Info.IsFromMe,
-			mediaType,
-		); err != nil {
-			fmt.Fprintf(os.Stderr, "store message error: %v\n", err)
-		}
-
-		fmt.Printf("New message from %s: %s\n", v.Info.Sender.User, content)
 	})
 
 	internalKey := os.Getenv("INTERNAL_API_KEY")
