@@ -1,0 +1,7 @@
+.env
+store/
+*.db
+*.log
+__pycache__/
+*.pyc
+whatsapp-bridge/whatsapp-bridge.exe

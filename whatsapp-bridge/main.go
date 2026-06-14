@@ -3,7 +3,9 @@ package main
 import (
 	"context"
 	"database/sql"
+	"database/sql/driver"
 	"encoding/json"
+	"strconv"
 	"fmt"
 	"net/http"
 	"os"
@@ -12,7 +14,7 @@ import (
 	"syscall"
 	"time"
 
-	_ "github.com/mattn/go-sqlite3"
+	_ "modernc.org/sqlite"
 	"github.com/mdp/qrterminal"
 	"go.mau.fi/whatsmeow"
 	waProto "go.mau.fi/whatsmeow/binary/proto"
@@ -20,6 +22,18 @@ import (
 	"go.mau.fi/whatsmeow/types/events"
 	waLog "go.mau.fi/whatsmeow/util/log"
 )
+
+type sqlite3Driver struct{ driver.Driver }
+
+func init() {
+	db, err := sql.Open("sqlite", ":memory:")
+	if err != nil {
+		return
+	}
+	drv := db.Driver()
+	db.Close()
+	sql.Register("sqlite3", sqlite3Driver{Driver: drv})
+}
 
 type MessageStore struct {
 	db  *sql.DB
@@ -30,7 +44,7 @@ func NewMessageStore() (*MessageStore, error) {
 	if err := os.MkdirAll("store", 0755); err != nil {
 		return nil, fmt.Errorf("create store dir: %w", err)
 	}
-	db, err := sql.Open("sqlite3", "file:store/messages.db?_foreign_keys=on&_journal_mode=WAL")
+	db, err := sql.Open("sqlite3", "file:store/messages.db?_pragma=foreign_keys(1)&_journal_mode=WAL")
 	if err != nil {
 		return nil, err
 	}
@@ -62,12 +76,36 @@ func (s *MessageStore) StoreMessage(id, chatJID, sender, content string, ts time
 	return err
 }
 
-func (s *MessageStore) GetRecentMessages(limit int) ([]map[string]interface{}, error) {
+func (s *MessageStore) GetRecentMessages(limit int, afterDate string, beforeDate string, contact string) ([]map[string]interface{}, error) {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
-	rows, err := s.db.Query(`
-		SELECT chat_jid, sender, content, timestamp, is_from_me, media_type
-		FROM messages ORDER BY timestamp DESC LIMIT ?`, limit)
+	if limit > 500 {
+		limit = 500
+	}
+	query := `SELECT chat_jid, sender, content, timestamp, is_from_me, media_type FROM messages`
+	args := []interface{}{}
+	conditions := []string{}
+	if afterDate != "" {
+		conditions = append(conditions, `timestamp >= ?`)
+		args = append(args, afterDate+"T00:00:00Z")
+	}
+	if beforeDate != "" {
+		conditions = append(conditions, `timestamp < ?`)
+		args = append(args, beforeDate+"T00:00:00Z")
+	}
+	if contact != "" {
+		conditions = append(conditions, `(sender = ? OR chat_jid LIKE ?)`)
+		args = append(args, contact, contact+"%")
+	}
+	if len(conditions) > 0 {
+		query += ` WHERE ` + conditions[0]
+		for _, c := range conditions[1:] {
+			query += ` AND ` + c
+		}
+	}
+	query += ` ORDER BY timestamp DESC LIMIT ?`
+	args = append(args, limit)
+	rows, err := s.db.Query(query, args...)
 	if err != nil {
 		return nil, err
 	}
@@ -98,7 +136,7 @@ func (s *MessageStore) GetRecentMessages(limit int) ([]map[string]interface{}, e
 
 func storeHistoryMessage(store *MessageStore, conversations []*waProto.Conversation) {
 	for _, conv := range conversations {
-		chatJID := conv.GetId()
+		chatJID := conv.GetID()
 		for _, histMsg := range conv.GetMessages() {
 			info := histMsg.GetMessage()
 			if info == nil {
@@ -136,7 +174,7 @@ func storeHistoryMessage(store *MessageStore, conversations []*waProto.Conversat
 			ts := time.Unix(int64(info.GetMessageTimestamp()), 0)
 
 			if err := store.StoreMessage(
-				info.GetKey().GetId(),
+				info.GetKey().GetID(),
 				chatJID,
 				sender,
 				content,
@@ -153,13 +191,13 @@ func storeHistoryMessage(store *MessageStore, conversations []*waProto.Conversat
 func main() {
 	logger := waLog.Stdout("Client", "INFO", true)
 
-	container, err := sqlstore.New("sqlite3", "file:store/whatsapp.db?_foreign_keys=on", waLog.Stdout("Database", "INFO", true))
+	container, err := sqlstore.New(context.Background(), "sqlite3", "file:store/whatsapp.db?_pragma=foreign_keys(1)", waLog.Stdout("Database", "INFO", true))
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "failed to open whatsapp store: %v\n", err)
 		os.Exit(1)
 	}
 
-	deviceStore, err := container.GetFirstDevice()
+	deviceStore, err := container.GetFirstDevice(context.Background())
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "failed to get device: %v\n", err)
 		os.Exit(1)
@@ -214,7 +252,17 @@ func main() {
 			http.Error(w, "Unauthorized", http.StatusUnauthorized)
 			return
 		}
-		msgs, err := messageStore.GetRecentMessages(50)
+		limitStr := r.URL.Query().Get("limit")
+		limit := 50
+		if limitStr != "" {
+			if l, err := strconv.Atoi(limitStr); err == nil {
+				limit = l
+			}
+		}
+		afterDate := r.URL.Query().Get("after_date")
+		beforeDate := r.URL.Query().Get("before_date")
+		contact := r.URL.Query().Get("contact")
+		msgs, err := messageStore.GetRecentMessages(limit, afterDate, beforeDate, contact)
 		if err != nil {
 			http.Error(w, "internal error", http.StatusInternalServerError)
 			return
@@ -222,7 +270,29 @@ func main() {
 		w.Header().Set("Content-Type", "application/json")
 		json.NewEncoder(w).Encode(msgs)
 	})
-
+http.HandleFunc("/contacts", func(w http.ResponseWriter, r *http.Request) {
+    if r.Header.Get("X-API-Key") != internalKey {
+        http.Error(w, "Unauthorized", http.StatusUnauthorized)
+        return
+    }
+    contacts, err := client.Store.Contacts.GetAllContacts(context.Background())
+    if err != nil {
+        http.Error(w, "internal error", http.StatusInternalServerError)
+        return
+    }
+    result := map[string]string{}
+    for jid, info := range contacts {
+        name := info.FullName
+        if name == "" {
+            name = info.PushName
+        }
+        if name != "" {
+            result[jid.User] = name
+        }
+    }
+    w.Header().Set("Content-Type", "application/json")
+    json.NewEncoder(w).Encode(result)
+})
 	http.HandleFunc("/health", func(w http.ResponseWriter, r *http.Request) {
 		w.Write([]byte("OK"))
 	})
