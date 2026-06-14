@@ -1,11 +1,43 @@
-import httpx
+import os
 import json
+import httpx
+from anthropic import Anthropic
 from mcp.server.fastmcp import FastMCP
 
 mcp = FastMCP("WhatsApp Bridge")
 
-API_KEY = "a3f8c2e1d4b7a9f0e5c8d2b1a4f7e0c3d6b9a2f5e8c1d4b7a0f3e6c9d2b5a8f1"
-BASE_URL = "http://localhost:8000"
+# Compatibilité avec le .env existant (API_KEY) + fallback hardcodé pour Claude Desktop
+API_KEY = os.getenv("WHATSAPP_API_KEY", os.getenv("API_KEY", "a3f8c2e1d4b7a9f0e5c8d2b1a4f7e0c3d6b9a2f5e8c1d4b7a0f3e6c9d2b5a8f1"))
+BASE_URL = os.getenv("WHATSAPP_BASE_URL", "http://localhost:8000")
+ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY")
+
+anthropic_client = Anthropic(api_key=ANTHROPIC_API_KEY) if ANTHROPIC_API_KEY else None
+
+CLASSIFICATION_PROMPT = """
+Tu es un expert en classification de conversations WhatsApp pour Taranis Cooperage Group.
+
+RÈGLES DE CLASSIFICATION :
+Un chat est "PRO" si :
+- Il concerne l'activité professionnelle de Taranis Cooperage (vente, achat, production ou logistique de tonneaux en chêne, fûts, barriques, etc.)
+- Les interlocuteurs sont : clients, prospects, fournisseurs, transporteurs, partenaires, comptables, banques, collègues, employés
+- Les sujets typiques : devis, commandes, prix, délais de livraison, spécifications techniques (225L, 228L, neuves, d'occasion, etc.), facturation, paiement, suivi de production, réclamations clients, RDV professionnels
+- Il y a des références à des montants, des quantités, des numéros de commande, des bons de livraison, des RDV d'affaires
+- Le ton est professionnel ou neutre-commercial
+
+Un chat est "PERSO" si :
+- Il concerne la vie privée : famille, amis, loisirs, sport, vacances, santé, blagues
+- Les sujets sont : week-end, soirées, enfants, voitures, maison, cuisine, films, musique, politique
+- Le ton est décontracté, avec des émojis excessifs, des "haha", "mdr"
+
+Règles de décision :
+- Un seul message personnel dans un chat majoritairement professionnel ne rend pas le chat "perso"
+- Un chat est classé selon sa nature dominante et son contexte global
+- En cas de doute, classe en "pro"
+
+Réponds UNIQUEMENT par un JSON valide :
+{"category": "pro" ou "perso", "confidence": 0.95, "reason": "Explication courte en une phrase"}
+"""
+
 
 @mcp.tool()
 def get_whatsapp_messages(limit: int = 50, after_date: str = "", before_date: str = "", contact: str = "") -> str:
@@ -23,25 +55,20 @@ def get_whatsapp_messages(limit: int = 50, after_date: str = "", before_date: st
         params["before_date"] = before_date
     if contact:
         params["contact"] = contact
-
-    with httpx.Client() as client:
-        response = client.get(
-            f"{BASE_URL}/messages",
-            headers={"X-API-Key": API_KEY},
-            params=params
-        )
+    with httpx.Client(timeout=30.0) as client:
+        response = client.get(f"{BASE_URL}/messages", headers={"X-API-Key": API_KEY}, params=params)
+        response.raise_for_status()
         return json.dumps(response.json(), ensure_ascii=False, indent=2)
+
 
 @mcp.tool()
 def get_whatsapp_history(after_date: str, before_date: str = "", contact: str = "", page_size: int = 500) -> str:
     """
     Récupère l'historique complet WhatsApp par pagination automatique.
-    Appelle get_whatsapp_messages en boucle en utilisant before_date comme curseur.
     - after_date: date de début (format: YYYY-MM-DD)
     - before_date: date de fin optionnelle (format: YYYY-MM-DD), défaut = aujourd'hui
     - contact: filtre par numéro optionnel
     - page_size: taille de chaque page (max 500)
-    Retourne tous les messages avec métadonnées de pagination.
     """
     all_messages = []
     page = 1
@@ -55,18 +82,13 @@ def get_whatsapp_history(after_date: str, before_date: str = "", contact: str = 
             params["contact"] = contact
 
         with httpx.Client(timeout=30.0) as client:
-            response = client.get(
-                f"{BASE_URL}/messages",
-                headers={"X-API-Key": API_KEY},
-                params=params
-            )
+            response = client.get(f"{BASE_URL}/messages", headers={"X-API-Key": API_KEY}, params=params)
             msgs = response.json()
 
         if not msgs:
             break
 
         all_messages.extend(msgs)
-
         oldest = msgs[-1]["timestamp"]
         next_cursor = oldest[:10]
 
@@ -81,21 +103,17 @@ def get_whatsapp_history(after_date: str, before_date: str = "", contact: str = 
         if page > 20:
             break
 
-    return json.dumps({
-        "total": len(all_messages),
-        "pages": page,
-        "messages": all_messages
-    }, ensure_ascii=False, indent=2)
+    return json.dumps({"total": len(all_messages), "pages": page, "messages": all_messages}, ensure_ascii=False, indent=2)
+
 
 @mcp.tool()
 def get_whatsapp_contacts() -> str:
     """Récupère le mapping numéro → nom des contacts WhatsApp."""
-    with httpx.Client() as client:
-        response = client.get(
-            f"{BASE_URL}/contacts",
-            headers={"X-API-Key": API_KEY},
-        )
+    with httpx.Client(timeout=30.0) as client:
+        response = client.get(f"{BASE_URL}/contacts", headers={"X-API-Key": API_KEY})
+        response.raise_for_status()
         return json.dumps(response.json(), ensure_ascii=False, indent=2)
+
 
 @mcp.tool()
 def send_whatsapp_message(to: str, message: str) -> str:
@@ -106,12 +124,78 @@ def send_whatsapp_message(to: str, message: str) -> str:
     IMPORTANT : toujours demander confirmation à l'utilisateur avant d'envoyer.
     """
     with httpx.Client(timeout=15.0) as client:
-        response = client.post(
-            f"{BASE_URL}/send",
-            headers={"X-API-Key": API_KEY},
-            json={"to": to, "message": message}
-        )
+        response = client.post(f"{BASE_URL}/send", headers={"X-API-Key": API_KEY}, json={"to": to, "message": message})
+        response.raise_for_status()
         return json.dumps(response.json(), ensure_ascii=False, indent=2)
+
+
+@mcp.tool()
+def get_pro_messages(limit: int = 200, after_date: str = "") -> str:
+    """
+    Récupère et classe les messages WhatsApp professionnels via LLM.
+    Filtre automatiquement les conversations pro des conversations perso.
+    - limit: nombre de messages à analyser (défaut 200)
+    - after_date: filtre à partir d'une date (format: YYYY-MM-DD)
+    Retourne uniquement les chats classés PRO avec confidence >= 0.7.
+    """
+    if not anthropic_client:
+        return json.dumps({"error": "ANTHROPIC_API_KEY non configuré"}, indent=2)
+
+    params = {"limit": limit}
+    if after_date:
+        params["after_date"] = after_date
+
+    with httpx.Client(timeout=60.0) as client:
+        resp = client.get(f"{BASE_URL}/messages", headers={"X-API-Key": API_KEY}, params=params)
+        resp.raise_for_status()
+        messages = resp.json()
+
+    # Regrouper par chat_jid (max 50 chats)
+    chats = {}
+    for msg in messages:
+        jid = msg.get("chat_jid", "unknown")
+        chats.setdefault(jid, []).append(msg)
+
+    chat_jids = list(chats.keys())[:50]
+    pro_chats = []
+
+    for jid in chat_jids:
+        chat_msgs = sorted(chats[jid], key=lambda x: x.get("timestamp", ""), reverse=True)[:15]
+        text_block = "\n".join(
+            f"{m.get('sender', '')}: {m.get('content', '')}" for m in chat_msgs
+        )
+
+        try:
+            completion = anthropic_client.messages.create(
+                model="claude-haiku-4-5-20251001",
+                max_tokens=150,
+                temperature=0.0,
+                system=CLASSIFICATION_PROMPT,
+                messages=[{"role": "user", "content": f"Chat JID: {jid}\n\nMessages:\n{text_block}"}],
+            )
+            content = completion.content[0].text.strip()
+            if "{" in content:
+                content = content[content.find("{"): content.rfind("}") + 1]
+            classification = json.loads(content)
+        except Exception:
+            classification = {"category": "pro", "confidence": 0.5, "reason": "Parse error - classé pro par défaut"}
+
+        if classification.get("category") == "pro" and classification.get("confidence", 0) >= 0.7:
+            pro_chats.append({
+                "chat_jid": jid,
+                "category": classification["category"],
+                "confidence": classification["confidence"],
+                "reason": classification.get("reason", ""),
+                "message_count": len(chat_msgs),
+                "messages": chat_msgs,
+            })
+
+    return json.dumps({
+        "total_chats": len(chat_jids),
+        "pro_chats": len(pro_chats),
+        "chats": pro_chats,
+    }, ensure_ascii=False, indent=2)
+
 
 if __name__ == "__main__":
     mcp.run(transport="stdio")
