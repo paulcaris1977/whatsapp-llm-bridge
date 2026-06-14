@@ -46,7 +46,7 @@ def get_whatsapp_history(after_date: str, before_date: str = "", contact: str = 
     all_messages = []
     page = 1
     cursor = before_date if before_date else ""
-    
+
     while True:
         params = {"limit": page_size, "after_date": after_date}
         if cursor:
@@ -67,12 +67,9 @@ def get_whatsapp_history(after_date: str, before_date: str = "", contact: str = 
 
         all_messages.extend(msgs)
 
-        # Le curseur devient le timestamp du dernier message (le plus ancien)
         oldest = msgs[-1]["timestamp"]
-        # Extraire la date du timestamp ISO pour la prochaine page
-        next_cursor = oldest[:10]  # YYYY-MM-DD
+        next_cursor = oldest[:10]
 
-        # Si le curseur n'a pas changé ou on a tout récupéré, on arrête
         if next_cursor >= (cursor if cursor else "9999-99-99"):
             break
         if next_cursor <= after_date:
@@ -81,7 +78,6 @@ def get_whatsapp_history(after_date: str, before_date: str = "", contact: str = 
         cursor = next_cursor
         page += 1
 
-        # Sécurité : max 20 pages
         if page > 20:
             break
 
@@ -98,6 +94,22 @@ def get_whatsapp_contacts() -> str:
         response = client.get(
             f"{BASE_URL}/contacts",
             headers={"X-API-Key": API_KEY},
+        )
+        return json.dumps(response.json(), ensure_ascii=False, indent=2)
+
+@mcp.tool()
+def send_whatsapp_message(to: str, message: str) -> str:
+    """
+    Envoie un message WhatsApp à un contact.
+    - to: numéro de téléphone au format international E.164 (ex: +33672573764)
+    - message: texte du message à envoyer
+    IMPORTANT : toujours demander confirmation à l'utilisateur avant d'envoyer.
+    """
+    with httpx.Client(timeout=15.0) as client:
+        response = client.post(
+            f"{BASE_URL}/send",
+            headers={"X-API-Key": API_KEY},
+            json={"to": to, "message": message}
         )
         return json.dumps(response.json(), ensure_ascii=False, indent=2)
 

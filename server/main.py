@@ -3,6 +3,7 @@ from fastapi.security import APIKeyHeader
 import httpx
 import os
 from typing import List, Dict, Optional
+from pydantic import BaseModel
 
 app = FastAPI(title="WhatsApp LLM Bridge")
 
@@ -21,6 +22,16 @@ def verify_api_key(x_api_key: str = Security(api_key_header)) -> str:
     if x_api_key != API_KEY:
         raise HTTPException(status_code=403, detail="Clé API invalide")
     return x_api_key
+
+
+# ─── Models ──────────────────────────────────────────────────────────────────
+
+class SendRequest(BaseModel):
+    to: str
+    message: str
+
+
+# ─── Routes ──────────────────────────────────────────────────────────────────
 
 @app.get("/messages", response_model=List[Dict])
 async def get_messages(
@@ -51,9 +62,6 @@ async def get_messages(
     except httpx.RequestError as e:
         raise HTTPException(status_code=503, detail=f"Bridge unreachable: {e}")
 
-@app.get("/health")
-async def health():
-    return {"status": "running"}
 
 @app.get("/contacts")
 async def get_contacts(api_key: str = Depends(verify_api_key)):
@@ -69,3 +77,28 @@ async def get_contacts(api_key: str = Depends(verify_api_key)):
         raise HTTPException(status_code=502, detail=f"Bridge error: {e.response.status_code}")
     except httpx.RequestError as e:
         raise HTTPException(status_code=503, detail=f"Bridge unreachable: {e}")
+
+
+@app.post("/send")
+async def send_message(
+    body: SendRequest,
+    api_key: str = Depends(verify_api_key)
+):
+    try:
+        async with httpx.AsyncClient(timeout=15.0) as client:
+            resp = await client.post(
+                f"{BRIDGE_URL}/send",
+                headers={"X-Internal-Key": INTERNAL_API_KEY},
+                json={"to": body.to, "message": body.message},
+            )
+            resp.raise_for_status()
+            return resp.json()
+    except httpx.HTTPStatusError as e:
+        raise HTTPException(status_code=e.response.status_code, detail=f"Bridge error: {e.response.text}")
+    except httpx.RequestError as e:
+        raise HTTPException(status_code=503, detail=f"Bridge unreachable: {e}")
+
+
+@app.get("/health")
+async def health():
+    return {"status": "running"}
