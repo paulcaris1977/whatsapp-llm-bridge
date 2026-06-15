@@ -1,7 +1,8 @@
-# server/main.py — v1.1.0
+# server/main.py — v1.2.0
 # Changelog :
 #   v1.0.0 — proxy GET /messages, GET /contacts, GET /health
 #   v1.1.0 — ajout POST /send (relay vers Go bridge)
+#   v1.2.0 — ajout GET /chats (liste chats avec noms)
 
 from fastapi import FastAPI, Depends, HTTPException, Security
 from fastapi.security import APIKeyHeader
@@ -75,6 +76,22 @@ async def get_contacts(api_key: str = Depends(verify_api_key)):
             resp = await client.get(
                 f"{BRIDGE_URL}/contacts",
                 headers={"X-API-Key": INTERNAL_API_KEY},
+            )
+            resp.raise_for_status()
+            return resp.json()
+    except httpx.HTTPStatusError as e:
+        raise HTTPException(status_code=502, detail=f"Bridge error: {e.response.status_code}")
+    except httpx.RequestError as e:
+        raise HTTPException(status_code=503, detail=f"Bridge unreachable: {e}")
+
+
+@app.get("/chats")
+async def get_chats(api_key: str = Depends(verify_api_key)):
+    try:
+        async with httpx.AsyncClient(timeout=30.0) as client:
+            resp = await client.get(
+                f"{BRIDGE_URL}/chats",
+                headers={"X-Internal-Key": INTERNAL_API_KEY},
             )
             resp.raise_for_status()
             return resp.json()

@@ -1,8 +1,9 @@
-# whatsapp_mcp.py — v1.2.0
+# whatsapp_mcp.py — v1.3.0
 # Changelog :
 #   v1.0.0 — get_whatsapp_messages, get_whatsapp_contacts, get_whatsapp_history
 #   v1.1.0 — ajout send_whatsapp_message
 #   v1.2.0 — ajout get_pro_messages (classification LLM pro/perso via Anthropic API)
+#   v1.3.0 — ajout list_whatsapp_chats (GET /chats + filtre dynamique LLM pro/perso)
 
 import os
 import json
@@ -200,6 +201,117 @@ def get_pro_messages(limit: int = 200, after_date: str = "") -> str:
         "total_chats": len(chat_jids),
         "pro_chats": len(pro_chats),
         "chats": pro_chats,
+    }, ensure_ascii=False, indent=2)
+
+
+
+# JIDs exclus définitivement (groupes perso, newsletters, spam)
+EXCLUDED_JIDS = {
+    "33672571698-1633559683@g.us",   # groupe perso français
+    "120363160863168828@g.us",        # exclu permanent
+    "120363180365005349@newsletter",  # newsletter
+    "status@broadcast",               # statuts WhatsApp
+}
+
+# Nom de chats clairement perso → exclusion directe sans LLM
+PERSO_KEYWORDS = ["famille", "family", "perso", "amis", "friends", "vacances"]
+
+
+def _classify_chat_by_name_and_content(chat_jid: str, chat_name: str, recent_messages: list) -> dict:
+    """Classification LLM d'un chat basée sur son nom + ses messages récents."""
+    # Exclusion directe par JID
+    if chat_jid in EXCLUDED_JIDS:
+        return {"category": "perso", "confidence": 1.0, "reason": "JID exclu définitivement"}
+
+    # Exclusion directe par nom (mots-clés perso évidents)
+    if any(kw in chat_name.lower() for kw in PERSO_KEYWORDS):
+        return {"category": "perso", "confidence": 0.95, "reason": f"Nom du chat contient un mot-clé perso : {chat_name}"}
+
+    if not anthropic_client:
+        return {"category": "pro", "confidence": 0.5, "reason": "Pas de client Anthropic - classé pro par défaut"}
+
+    text_block = "\n".join(
+        f"{m.get('sender', '')}: {m.get('content', '')}"
+        for m in recent_messages[:15]
+        if m.get('content', '').strip()
+    ) or f"[Pas de messages texte — nom du chat : {chat_name}]"
+
+    try:
+        completion = anthropic_client.messages.create(
+            model="claude-haiku-4-5-20251001",
+            max_tokens=150,
+            temperature=0.0,
+            system=CLASSIFICATION_PROMPT,
+            messages=[{"role": "user", "content": f"Chat JID: {chat_jid}\nNom du chat: {chat_name}\n\nMessages récents:\n{text_block}"}],
+        )
+        content = completion.content[0].text.strip()
+        if "{" in content:
+            content = content[content.find("{"): content.rfind("}") + 1]
+        return json.loads(content)
+    except Exception:
+        return {"category": "pro", "confidence": 0.5, "reason": "Parse error - classé pro par défaut"}
+
+
+@mcp.tool()
+def list_whatsapp_chats(pro_only: bool = True) -> str:
+    """
+    Liste tous les chats WhatsApp avec leur nom réel.
+    Utilise un filtre LLM dynamique pour séparer pro/perso.
+    - pro_only: si True (défaut), retourne uniquement les chats PRO (confidence >= 0.7)
+                si False, retourne tous les chats avec leur classification
+    Les JIDs exclus définitivement (perso, newsletters) sont toujours filtrés.
+    """
+    # 1. Récupérer tous les chats avec noms
+    with httpx.Client(timeout=60.0) as client:
+        resp = client.get(f"{BASE_URL}/chats", headers={"X-API-Key": API_KEY})
+        resp.raise_for_status()
+        chats = resp.json()
+
+    # 2. Récupérer les messages récents pour la classification
+    with httpx.Client(timeout=60.0) as client:
+        resp = client.get(f"{BASE_URL}/messages", headers={"X-API-Key": API_KEY}, params={"limit": 500})
+        resp.raise_for_status()
+        all_messages = resp.json()
+
+    # Indexer les messages par chat_jid
+    messages_by_jid = {}
+    for msg in all_messages:
+        jid = msg.get("chat_jid", "")
+        messages_by_jid.setdefault(jid, []).append(msg)
+
+    # 3. Classifier chaque chat
+    results = []
+    for chat in chats:
+        jid = chat["chat_jid"]
+        name = chat["name"]
+
+        # Exclure les JIDs sans nom résolu (JID brut = groupe inconnu/inactif)
+        if name == jid and "@g.us" in jid:
+            continue
+
+        recent_msgs = messages_by_jid.get(jid, [])
+        classification = _classify_chat_by_name_and_content(jid, name, recent_msgs)
+
+        entry = {
+            "chat_jid": jid,
+            "name": name,
+            "type": chat["type"],
+            "category": classification["category"],
+            "confidence": classification["confidence"],
+            "reason": classification.get("reason", ""),
+        }
+
+        if pro_only:
+            if classification["category"] == "pro" and classification["confidence"] >= 0.7:
+                results.append(entry)
+        else:
+            results.append(entry)
+
+    return json.dumps({
+        "total": len(chats),
+        "returned": len(results),
+        "pro_only": pro_only,
+        "chats": results,
     }, ensure_ascii=False, indent=2)
 
 
