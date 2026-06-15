@@ -1,3 +1,10 @@
+// whatsapp-bridge/main.go — v1.3.0
+// Changelog :
+//   v1.0.0 — lecture messages + contacts + session persistée
+//   v1.1.0 — POST /send avec rate limiting, logging SQLite, validation E.164
+//   v1.2.0 — fix SQLITE_BUSY (WAL + busy_timeout 5s sur les deux bases)
+//   v1.3.0 — GET /chats + enrichissement chat_name dans GET /messages + ChatCache thread-safe
+
 package main
 
 import (
@@ -46,6 +53,95 @@ type SendResponse struct {
 	MessageID string `json:"message_id,omitempty"`
 	Timestamp string `json:"timestamp,omitempty"`
 	Error     string `json:"error,omitempty"`
+}
+
+// ─── ChatCache ────────────────────────────────────────────────────────────────
+
+type ChatInfo struct {
+	ChatJID string `json:"chat_jid"`
+	Name    string `json:"name"`
+	Type    string `json:"type"` // "group" ou "individual"
+}
+
+type ChatCache struct {
+	mu    sync.RWMutex
+	names map[string]string
+}
+
+func NewChatCache() *ChatCache {
+	return &ChatCache{names: make(map[string]string)}
+}
+
+func (c *ChatCache) Get(jid string) (string, bool) {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	name, ok := c.names[jid]
+	return name, ok
+}
+
+func (c *ChatCache) Set(jid, name string) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.names[jid] = name
+}
+
+// ResolveName retourne le nom lisible d'un chat JID.
+// Groupe (@g.us) → GetGroupInfo avec timeout 5s.
+// Individuel → contacts store.
+// Fallback → jidStr brut.
+func (c *ChatCache) ResolveName(client *whatsmeow.Client, jidStr string) string {
+	if name, ok := c.Get(jidStr); ok {
+		return name
+	}
+	jid, err := types.ParseJID(jidStr)
+	if err != nil {
+		return jidStr
+	}
+	var name string
+	if strings.HasSuffix(jidStr, "@g.us") {
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		info, err := client.GetGroupInfo(ctx, jid)
+		if err == nil && info != nil {
+			name = info.Name
+		}
+	} else {
+		ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+		defer cancel()
+		contacts, err := client.Store.Contacts.GetAllContacts(ctx)
+		if err == nil {
+			if info, ok := contacts[jid]; ok {
+				name = info.FullName
+				if name == "" {
+					name = info.PushName
+				}
+			}
+		}
+	}
+	if name == "" {
+		name = jidStr
+	}
+	c.Set(jidStr, name)
+	return name
+}
+
+// PopulateFromContacts pré-charge les noms des contacts individuels au démarrage.
+func (c *ChatCache) PopulateFromContacts(client *whatsmeow.Client) {
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	contacts, err := client.Store.Contacts.GetAllContacts(ctx)
+	if err != nil {
+		return
+	}
+	for jid, info := range contacts {
+		name := info.FullName
+		if name == "" {
+			name = info.PushName
+		}
+		if name != "" {
+			c.Set(jid.String(), name)
+		}
+	}
 }
 
 // ─── MessageStore ─────────────────────────────────────────────────────────────
@@ -328,6 +424,9 @@ func main() {
 	}
 	defer messageStore.db.Close()
 
+	// Cache des noms de chats (groupes + contacts)
+	chatCache := NewChatCache()
+
 	// ── Event Handler ────────────────────────────────────────────────────────
 	client.AddEventHandler(func(evt interface{}) {
 		switch v := evt.(type) {
@@ -363,15 +462,8 @@ func main() {
 			go storeHistoryMessages(messageStore, v.Data.GetConversations())
 
 		case *events.Connected:
-			// Type correct dans whatsmeow : events.Connected (pas ClientConnected)
 			fmt.Println("[wa] connected successfully")
-			go func() {
-				if err := client.Store.Contacts.Sync(context.Background()); err != nil {
-					fmt.Fprintf(os.Stderr, "[wa] contacts sync error: %v\n", err)
-				} else {
-					fmt.Println("[wa] contacts synced")
-				}
-			}()
+			go chatCache.PopulateFromContacts(client)
 
 		case *events.ConnectFailure:
 			fmt.Fprintf(os.Stderr, "[wa] connect failure: %v\n", v.Reason)
@@ -390,6 +482,35 @@ func main() {
 		writeJSON(w, map[string]interface{}{"status": "running", "connected": connected}, http.StatusOK)
 	})
 
+	// GET /chats
+	mux.HandleFunc("/chats", auth(func(w http.ResponseWriter, r *http.Request) {
+		// Peupler le cache depuis les contacts individuels
+		chatCache.PopulateFromContacts(client)
+
+		// Récupérer les JIDs distincts depuis la base messages
+		rows, err := messageStore.db.Query(`SELECT DISTINCT chat_jid FROM messages ORDER BY chat_jid`)
+		if err != nil {
+			http.Error(w, "internal error", http.StatusInternalServerError)
+			return
+		}
+		defer rows.Close()
+
+		var chats []ChatInfo
+		for rows.Next() {
+			var jidStr string
+			if err := rows.Scan(&jidStr); err != nil {
+				continue
+			}
+			typ := "individual"
+			if strings.HasSuffix(jidStr, "@g.us") {
+				typ = "group"
+			}
+			name := chatCache.ResolveName(client, jidStr)
+			chats = append(chats, ChatInfo{ChatJID: jidStr, Name: name, Type: typ})
+		}
+		writeJSON(w, chats, http.StatusOK)
+	}))
+
 	// GET /messages
 	mux.HandleFunc("/messages", auth(func(w http.ResponseWriter, r *http.Request) {
 		// Parsing du limit dans le handler ; la normalisation reste dans GetRecentMessages
@@ -406,6 +527,13 @@ func main() {
 		if err != nil {
 			http.Error(w, err.Error(), http.StatusBadRequest)
 			return
+		}
+		// Enrichir chaque message avec le nom lisible du chat
+		for i := range msgs {
+			jidStr, _ := msgs[i]["chat_jid"].(string)
+			if jidStr != "" {
+				msgs[i]["chat_name"] = chatCache.ResolveName(client, jidStr)
+			}
 		}
 		writeJSON(w, msgs, http.StatusOK)
 	}))

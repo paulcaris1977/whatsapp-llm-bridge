@@ -1,3 +1,8 @@
+# server/main.py — v1.1.0
+# Changelog :
+#   v1.0.0 — proxy GET /messages, GET /contacts, GET /health
+#   v1.1.0 — ajout POST /send (relay vers Go bridge)
+
 from fastapi import FastAPI, Depends, HTTPException, Security
 from fastapi.security import APIKeyHeader
 import httpx

@@ -1,3 +1,9 @@
+# whatsapp_mcp.py — v1.2.0
+# Changelog :
+#   v1.0.0 — get_whatsapp_messages, get_whatsapp_contacts, get_whatsapp_history
+#   v1.1.0 — ajout send_whatsapp_message
+#   v1.2.0 — ajout get_pro_messages (classification LLM pro/perso via Anthropic API)
+
 import os
 import json
 import httpx
