@@ -1,13 +1,16 @@
-# whatsapp_mcp.py — v1.3.0
+# whatsapp_mcp.py — v1.4.1
 # Changelog :
 #   v1.0.0 — get_whatsapp_messages, get_whatsapp_contacts, get_whatsapp_history
 #   v1.1.0 — ajout send_whatsapp_message
 #   v1.2.0 — ajout get_pro_messages (classification LLM pro/perso via Anthropic API)
 #   v1.3.0 — ajout list_whatsapp_chats (GET /chats + filtre dynamique LLM pro/perso)
+#   v1.4.0 — get_pro_messages paginé par fenêtre days_window (fix limite 1MB)
+#   v1.4.1 — fix: import datetime en tête, exceptions spécifiques, caps arbitraires supprimés
 
 import os
 import json
 import httpx
+from datetime import datetime, timedelta
 from anthropic import Anthropic
 from mcp.server.fastmcp import FastMCP
 
@@ -137,25 +140,48 @@ def send_whatsapp_message(to: str, message: str) -> str:
 
 
 @mcp.tool()
-def get_pro_messages(limit: int = 200, after_date: str = "") -> str:
+def get_pro_messages(after_date: str, days_window: int = 7, limit_per_window: int = 200) -> str:
     """
     Récupère et classe les messages WhatsApp professionnels via LLM.
-    Filtre automatiquement les conversations pro des conversations perso.
-    - limit: nombre de messages à analyser (défaut 200)
-    - after_date: filtre à partir d'une date (format: YYYY-MM-DD)
+    Pagine automatiquement par fenêtre de jours pour éviter la limite 1MB.
+    - after_date: date de début obligatoire (format: YYYY-MM-DD, ex: 2026-06-01)
+    - days_window: taille de la fenêtre en jours (défaut 7, max 14)
+    - limit_per_window: messages max par fenêtre (défaut 200)
     Retourne uniquement les chats classés PRO avec confidence >= 0.7.
+    Pour analyser une longue période, appeler plusieurs fois en incrémentant after_date.
+    Exemple : semaine 1 → after_date="2026-06-01", semaine 2 → after_date="2026-06-08"
     """
     if not anthropic_client:
         return json.dumps({"error": "ANTHROPIC_API_KEY non configuré"}, indent=2)
 
-    params = {"limit": limit}
-    if after_date:
-        params["after_date"] = after_date
+    # Calculer before_date = after_date + days_window
+    try:
+        start = datetime.strptime(after_date, "%Y-%m-%d")
+    except ValueError:
+        return json.dumps({"error": f"Format de date invalide : {after_date}. Utiliser YYYY-MM-DD"}, indent=2)
+
+    end = start + timedelta(days=days_window)
+    before_date = end.strftime("%Y-%m-%d")
+
+    params = {
+        "limit": limit_per_window,
+        "after_date": after_date,
+        "before_date": before_date,
+    }
 
     with httpx.Client(timeout=60.0) as client:
         resp = client.get(f"{BASE_URL}/messages", headers={"X-API-Key": API_KEY}, params=params)
         resp.raise_for_status()
         messages = resp.json()
+
+    if not messages:
+        return json.dumps({
+            "window": f"{after_date} → {before_date}",
+            "total_chats": 0,
+            "pro_chats": 0,
+            "chats": [],
+            "next_after_date": before_date,
+        }, ensure_ascii=False, indent=2)
 
     # Regrouper par chat_jid (max 50 chats)
     chats = {}
@@ -170,7 +196,8 @@ def get_pro_messages(limit: int = 200, after_date: str = "") -> str:
         chat_msgs = sorted(chats[jid], key=lambda x: x.get("timestamp", ""), reverse=True)[:15]
         text_block = "\n".join(
             f"{m.get('sender', '')}: {m.get('content', '')}" for m in chat_msgs
-        )
+            if m.get('content', '').strip()
+        ) or "[Pas de messages texte]"
 
         try:
             completion = anthropic_client.messages.create(
@@ -184,12 +211,15 @@ def get_pro_messages(limit: int = 200, after_date: str = "") -> str:
             if "{" in content:
                 content = content[content.find("{"): content.rfind("}") + 1]
             classification = json.loads(content)
-        except Exception:
+        except (json.JSONDecodeError, KeyError, IndexError):
             classification = {"category": "pro", "confidence": 0.5, "reason": "Parse error - classé pro par défaut"}
+        except Exception as e:
+            classification = {"category": "pro", "confidence": 0.5, "reason": f"Erreur API Anthropic: {type(e).__name__}"}
 
         if classification.get("category") == "pro" and classification.get("confidence", 0) >= 0.7:
             pro_chats.append({
                 "chat_jid": jid,
+                "chat_name": chat_msgs[0].get("chat_name", jid) if chat_msgs else jid,
                 "category": classification["category"],
                 "confidence": classification["confidence"],
                 "reason": classification.get("reason", ""),
@@ -198,8 +228,11 @@ def get_pro_messages(limit: int = 200, after_date: str = "") -> str:
             })
 
     return json.dumps({
+        "window": f"{after_date} → {before_date}",
+        "total_messages": len(messages),
         "total_chats": len(chat_jids),
         "pro_chats": len(pro_chats),
+        "next_after_date": before_date,  # ← utiliser pour l'appel suivant
         "chats": pro_chats,
     }, ensure_ascii=False, indent=2)
 
